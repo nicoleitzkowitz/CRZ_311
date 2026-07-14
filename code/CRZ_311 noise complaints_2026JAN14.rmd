@@ -1,0 +1,562 @@
+---
+title: "CRZ_311 noise complaints- descriptives"
+author: "Nicole Itzkowitz"
+date: "2026-01-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## set up
+libraries
+```{r, results='hide', message = 'hide'}
+library(readr)
+library(dplyr)
+library(lubridate)
+library(janitor)
+library(ggplot2)
+library(data.table)
+library(sf)
+library(sandwich)
+library(lmtest)
+library(nycOpenData)
+```
+
+311 data: January 01 2024 12:00 - January 01 2026 12:00, noise complaints only 
+```{r data noise, results='hide'}
+noise <- fread("/Users/ni2267/Documents/BEH/CRZ/CRZ_311/data/311_Service_Requests_20240101_20260101_noise.csv") |> clean_names()
+# n=1,586,276
+
+# alternative- pull using api but it doesn't work very well for large files- will come back to this
+# noise <- nyc_pull_dataset(
+#   dataset = "erm2-nwe9",
+#   from = "2024-01-01",
+#   to = "2025-12-31",
+#   date_field = "created_date",
+#   where = "complaint_type LIKE '%Noise%'",
+#   limit = 200000,
+#   timeout_sec = 1000)
+                          
+# remove complaints with missing values for long/lat (n = 6,810)
+noise <- dplyr::filter(noise, !is.na(noise$longitude))
+
+# n = 1,579,466 complaints (across all boroughs, all types of noise complaints)
+```
+
+geofence data
+```{r data geo}
+# CRZ geofence from:  https://data.ny.gov/Transportation/MTA-Central-Business-District-Geofence-Beginning-J/srxy-5nxn/about_data
+crz <- read_sf("/Users/ni2267/Documents/BEH/CRZ/CRZ_311/data/MTA Central Business District Geofence_ Beginning June 2024_20250619/geo_export_d6c2fec2-3927-49c2-98c0-6c2b3edffa39.shp")
+crz <- st_transform(crz, crs = "WGS84")
+
+# ctrl area created in QGIS
+ctrl <- read_sf("/Users/ni2267/Documents/BEH/CRZ/CRZ_311/data/crz_control/crz_control.shp")
+ctrl <- st_transform(ctrl, crs = "WGS84")
+```
+note: eventually we need to update these to exclude some defined area along the border of the zones
+
+dates
+```{r data management clean dates}
+noise$created_date <- lubridate::mdy_hms(noise$created_date)
+noise$month_year <- format(noise$created_date, "%Y-%m")
+```
+
+classify traffic noise 
+```{r data management classify traffic noise}
+# check types of noise complaints
+noise |> with(table(problem_detail_formerly_descriptor))
+
+noise$traffic_noise <- case_when(noise$problem_detail_formerly_descriptor == "Car/Truck Horn" ~ 1,
+                              noise$problem_detail_formerly_descriptor == "Car/Truck Music" ~ 1,
+                              noise$problem_detail_formerly_descriptor == "Engine Idling" ~ 1,
+                              noise$problem_detail_formerly_descriptor == "Noise: Vehicle (NR2)" ~ 1,
+                              .default = 0)
+
+noise |> with(table(problem_detail_formerly_descriptor, traffic_noise))
+
+# n = 93,627 traffic related  noise complaints 
+
+trafficnoise <- filter(noise, traffic_noise == 1)
+```
+
+geocode noise complaints
+```{r data management zones}
+# convert crashes into a shapefile
+trafficnoise_sf <- st_as_sf(trafficnoise,
+                       coords = c("longitude", "latitude"),
+                       crs = "WGS84")
+
+# attribute crash points to within CRZ
+within_crz <- apply(st_within(trafficnoise_sf, crz, sparse = FALSE), 1, any)
+trafficnoise_sf$crz <- as.integer(within_crz)
+
+# attribute crash points to control zone
+within_ctrl <- apply(st_within(trafficnoise_sf, ctrl, sparse = FALSE), 1, any)
+trafficnoise_sf$ctrl <- as.integer(within_ctrl)
+
+table(trafficnoise_sf$crz)
+table(trafficnoise_sf$ctrl)
+
+# crz_ctrl variable
+trafficnoise_sf$crz_ctrl <- ifelse(trafficnoise_sf$crz == 1, 1,
+                              ifelse(trafficnoise_sf$ctrl == 1, 0, NA))
+
+trafficnoise_sf <- select(trafficnoise_sf, -c("crz", "ctrl"))
+
+## subset data to only crz and ctrl noise complaints
+df <- dplyr::filter(trafficnoise_sf, trafficnoise_sf$crz_ctrl == 0 | trafficnoise_sf$crz_ctrl == 1)
+# n = 20,920 ALL traffic-related noise complaints within crz and ctrl zones
+
+# df: each row represents a noise complaint , and crz_ctrl represents whether it was in  the crz or not
+```
+
+```{r data management zone month}
+# create month variable
+df$month_year <- paste0(year(df$created_date), "-", sprintf("%02d",month(df$created_date)))
+df$pre_post <- ifelse(df$created_date > as.Date("2025-01-01"), 1, 0)
+```
+
+```{r}
+# save shapefile, if needed for viz later on
+df_subset <- select(df, c(unique_key, problem_formerly_complaint_type, crz_ctrl, traffic_noise, pre_post, month_year, geometry))
+st_write(df_subset, "/Users/ni2267/Documents/BEH/CRZ/CRZ_311/data/crz_ctrl_noise_complaints.gpkg", append = F)
+```
+
+```{r data management aggregate by month year}
+# aggregate by month year
+zone_month_counts <- df %>%
+  group_by(month_year, crz_ctrl, pre_post) %>%
+  summarise(
+    count_total   = n(),
+    count_horn = sum(problem_detail_formerly_descriptor == "Car/Truck Horn", na.rm = TRUE),
+    count_music = sum(problem_detail_formerly_descriptor == "Car/Truck Music", na.rm = TRUE),
+    count_idle = sum(problem_detail_formerly_descriptor == "Engine Idling", na.rm = TRUE),
+    count_horn_idle = count_horn + count_idle,
+    .groups = "drop"
+  )
+
+zone_month_counts <- as.data.frame(zone_month_counts)
+zone_month_counts <- select(zone_month_counts, -"geometry")
+zone_month_counts$zone <- as.factor(ifelse(zone_month_counts$crz_ctrl == 1, "crz", "ctrl"))
+```
+
+## did: all road traffic-related noise complaints
+### did plot
+```{r did plot zone months}
+summary(zone_month_counts$count_total)
+
+zone_month_counts %>% 
+  group_by(month_year, zone) %>%
+
+  ggplot(aes(x = month_year, y = count_total, color = zone, group = zone)) +
+  geom_line() +
+  labs(x = "month", y = "zone count", color = "CRZ") +
+  scale_x_discrete(breaks = function(x) x[seq(1, length(x), by = 2)]) +
+  geom_vline(xintercept = "2025-01", linetype = "solid", color = "black") +
+  theme_minimal() +
+   theme(axis.text.x = element_text(angle = 90, hjust = 1)) 
+
+
+# save image as pdf
+# ggsave("did_month_plot.pdf", plot = fig1, device = "pdf", height = 6, width = 8, units = "in")
+
+```
+
+### did analysis
+```{r did zone months}
+did_zone_month <- glm(count_total ~ pre_post + crz_ctrl + pre_post*crz_ctrl, data = zone_month_counts, family = "poisson")
+
+summary(did_zone_month)
+exp(coef(did_zone_month))
+exp(confint(did_zone_month))
+
+#cluster-robust standard errors
+clustered_vcov <- vcovCL(did_zone_month, cluster = ~month_year)
+exp(coef(coeftest(did_zone_month, vcov = clustered_vcov)))
+exp(confint(coeftest(did_zone_month, vcov = clustered_vcov)))
+```
+
+## did: congestion related noise complaints only
+restricting to ONLY complaints about car/truck horn and engine idling
+
+### did2 plot
+```{r did2 plot zone months}
+summary(zone_month_counts$count_horn_idle)
+
+zone_month_counts %>% 
+  group_by(month_year, zone) %>%
+
+  ggplot(aes(x = month_year, y = count_horn_idle, color = zone, group = zone)) +
+  geom_line(linewidth = 1.2) +
+  labs(x = "month", y = "zone count", color = "CRZ") +
+  scale_x_discrete(breaks = function(x) x[seq(1, length(x), by = 2)]) +
+  geom_vline(xintercept = "2025-01", linetype = "dashed", color = "black") +
+  theme_minimal() +
+   theme(axis.text.x = element_text(angle = 90, hjust = 1)) -> did2
+
+print(did2)
+
+ggsave(
+  "/Users/ni2267/Documents/BEH/CRZ/CRZ_311/output/crz311.png",
+  did2,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+
+# also save to icben presentation- can delete this later
+ggsave(
+  "/Users/ni2267/Documents/Columbia/Conferences/ICBEN_2026/presentation/crz311.png",
+  did2,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+```
+### descriptives
+```{r}
+# pre-intervention mean
+zone_month_counts |> 
+  filter(pre_post == 0) |> 
+  group_by(crz_ctrl) %>%
+    summarise(
+      mean_val = mean(count_horn_idle, na.rm = TRUE)
+  )
+
+# post-intervention mean
+zone_month_counts |> 
+  filter(pre_post == 1) |> 
+  group_by(crz_ctrl) %>%
+    summarise(
+      mean_val = mean(count_horn_idle, na.rm = TRUE)
+  )
+```
+
+### did2 analysis
+```{r did2 zone months}
+did_zone_month2 <- glm(count_horn_idle ~ pre_post + crz_ctrl + pre_post*crz_ctrl, data = zone_month_counts, family = "poisson")
+
+summary(did_zone_month2)
+exp(coef(did_zone_month2))
+exp(confint(did_zone_month2))
+
+#cluster-robust standard errors
+clustered_vcov <- vcovCL(did_zone_month2, cluster = ~month_year)
+exp(coef(coeftest(did_zone_month2, vcov = clustered_vcov)))
+exp(confint(coeftest(did_zone_month2, vcov = clustered_vcov)))
+```
+
+
+## did: congestion related noise complaints only v3
+restricting to ONLY complaints about car/truck horn 
+
+### did3 plot
+```{r did3 plot zone months}
+summary(zone_month_counts$count_horn)
+
+zone_month_counts %>% 
+  group_by(month_year, zone) %>%
+
+  ggplot(aes(x = month_year, y = count_horn, color = zone, group = zone)) +
+  geom_line() +
+  labs(x = "month", y = "zone count", color = "CRZ") +
+  scale_x_discrete(breaks = function(x) x[seq(1, length(x), by = 2)]) +
+  geom_vline(xintercept = "2025-01", linetype = "solid", color = "black") +
+  theme_minimal() +
+   theme(axis.text.x = element_text(angle = 90, hjust = 1)) 
+```
+
+### did3 analysis
+```{r did3 zone months}
+did_zone_month3 <- glm(count_horn ~ pre_post + crz_ctrl + pre_post*crz_ctrl, data = zone_month_counts, family = "poisson")
+
+summary(did_zone_month3)
+exp(coef(did_zone_month3))
+exp(confint(did_zone_month3))
+
+#cluster-robust standard errors
+clustered_vcov <- vcovCL(did_zone_month3, cluster = ~month_year)
+exp(coef(coeftest(did_zone_month3, vcov = clustered_vcov)))
+exp(confint(coeftest(did_zone_month3, vcov = clustered_vcov)))
+```
+
+
+## did: congestion related noise complaints only v4
+restricting to ONLY complaints about engine idling 
+
+### did4 plot
+```{r did4 plot zone months}
+summary(zone_month_counts$count_idle)
+
+zone_month_counts %>% 
+  group_by(month_year, zone) %>%
+
+  ggplot(aes(x = month_year, y = count_idle, color = zone, group = zone)) +
+  geom_line() +
+  labs(x = "month", y = "zone count", color = "CRZ") +
+  scale_x_discrete(breaks = function(x) x[seq(1, length(x), by = 2)]) +
+  geom_vline(xintercept = "2025-01", linetype = "solid", color = "black") +
+  theme_minimal() +
+   theme(axis.text.x = element_text(angle = 90, hjust = 1)) 
+```
+
+### did4 analysis
+```{r did4 zone months}
+did_zone_month4 <- glm(count_idle ~ pre_post + crz_ctrl + pre_post*crz_ctrl, data = zone_month_counts, family = "poisson")
+
+summary(did_zone_month4)
+exp(coef(did_zone_month4))
+exp(confint(did_zone_month4))
+
+#cluster-robust standard errors
+clustered_vcov <- vcovCL(did_zone_month4, cluster = ~month_year)
+exp(coef(coeftest(did_zone_month4, vcov = clustered_vcov)))
+exp(confint(coeftest(did_zone_month4, vcov = clustered_vcov)))
+```
+
+## separate ITS for each zone- traffic noise 
+
+```{r its set up}
+# create season variable, by month
+# winter: dec, jan, feb
+# spring: mar, apr, may
+# summer: jun, jul, aug
+# autumn: sept, oct, nov
+zone_month_counts$season <- ifelse(grepl("-01|-02|-12", zone_month_counts$month_year), 1, 
+                                  ifelse(grepl("-03|-04|-05", zone_month_counts$month_year), 2, 
+                                         ifelse(grepl("-06|-07|-08", zone_month_counts$month_year), 3, 4)))
+
+```
+
+### its: plots, all complaints
+#### crz all
+```{r its crz all plot}
+zone_month_counts %>% 
+  filter(crz_ctrl == 1) |> 
+   ggplot(aes(x = month_year, y = count_total, color = zone, group = zone)) +
+  geom_line( color = "#F8766D") +
+  labs(x = "month", y = "zone count", color = "CRZ") +
+  scale_x_discrete(breaks = function(x) x[seq(1, length(x), by = 2)]) +
+  geom_vline(xintercept = "2025-01", linetype = "solid", color = "black") +
+  theme_minimal() +
+   theme(axis.text.x = element_text(angle = 90, hjust = 1)) 
+```
+
+#### ctrl all
+```{r its ctrl all plot}
+zone_month_counts %>% 
+  filter(crz_ctrl == 0) |> 
+   ggplot(aes(x = month_year, y = count_total, color = zone, group = zone)) +
+  geom_line(color = "#00BFC4") +
+  labs(x = "month", y = "zone count", color = "CRZ") +
+  scale_x_discrete(breaks = function(x) x[seq(1, length(x), by = 2)]) +
+  geom_vline(xintercept = "2025-01", linetype = "solid", color = "black") +
+  theme_minimal() +
+   theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+###: its: analysis, all complaints
+#### crz: all
+```{r its: crz}
+zone_month_counts %>%
+  filter(crz_ctrl == 1) %>%
+  mutate(time = row_number()) %>%
+glm(count_total ~ time + pre_post + time*pre_post + season, data = ., family = "poisson") -> crz_month_season
+
+summary(crz_month_season)
+exp(coef(crz_month_season))
+exp(confint(crz_month_season))
+```
+
+#### ctrl: all
+```{r its: ctrl}
+zone_month_counts %>%
+  filter(crz_ctrl == 0) %>%
+  mutate(time = row_number()) %>%
+glm(count_total ~ time + pre_post + time*pre_post + season, data = ., family = "poisson") -> ctrl_month_season
+
+summary(ctrl_month_season)
+exp(coef(ctrl_month_season))
+exp(confint(ctrl_month_season))
+```
+
+### its: horn and idling only
+#### crz horn and idling
+```{r its crz horn and idling plot}
+zone_month_counts %>% 
+  filter(crz_ctrl == 1) |> 
+   ggplot(aes(x = month_year, y = count_horn_idle, color = zone, group = zone)) +
+  geom_line( color = "#F8766D") +
+  labs(x = "month", y = "zone count", color = "CRZ") +
+  scale_x_discrete(breaks = function(x) x[seq(1, length(x), by = 2)]) +
+  geom_vline(xintercept = "2025-01", linetype = "solid", color = "black") +
+  theme_minimal() +
+   theme(axis.text.x = element_text(angle = 90, hjust = 1)) 
+```
+
+#### ctrl horn and idling
+```{r its ctrl horn and idling plot}
+zone_month_counts %>% 
+  filter(crz_ctrl == 0) |> 
+   ggplot(aes(x = month_year, y = count_horn_idle, color = zone, group = zone)) +
+  geom_line(color = "#00BFC4") +
+  labs(x = "month", y = "zone count", color = "CRZ") +
+  scale_x_discrete(breaks = function(x) x[seq(1, length(x), by = 2)]) +
+  geom_vline(xintercept = "2025-01", linetype = "solid", color = "black") +
+  theme_minimal() +
+   theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+#### crz: horn and idling
+```{r its: crz horn and idling}
+zone_month_counts %>%
+  filter(crz_ctrl == 1) %>%
+  mutate(time = row_number()) %>%
+glm(count_horn_idle ~ time + pre_post + time*pre_post + season, data = ., family = "poisson") -> crz_month_season
+
+summary(crz_month_season)
+exp(coef(crz_month_season))
+exp(confint(crz_month_season))
+```
+
+#### ctrl: horn and idling
+```{r its: ctrl horn and idling}
+zone_month_counts %>%
+  filter(crz_ctrl == 0) %>%
+  mutate(time = row_number()) %>%
+glm(count_horn_idle ~ time + pre_post + time*pre_post + season, data = ., family = "poisson") -> ctrl_month_season
+
+summary(ctrl_month_season)
+exp(coef(ctrl_month_season))
+exp(confint(ctrl_month_season))
+```
+
+
+## negative controls: residential noise
+
+### data set up 
+311 data: January 01 2024 12:00 - January 01 2026 12:00, noise complaints only 
+```{r data residential noise, results='hide'}
+res_noise <- filter(noise, problem_formerly_complaint_type == "Noise - Residential")
+# n=841,185
+```
+
+```{r data geocode residential noise}
+# convert crashes into a shapefile
+resnoise_sf <- st_as_sf(res_noise,
+                       coords = c("longitude", "latitude"),
+                       crs = "WGS84")
+
+# attribute crash points to within CRZ
+within_crz <- apply(st_within(resnoise_sf, crz, sparse = FALSE), 1, any)
+resnoise_sf$crz <- as.integer(within_crz)
+
+# attribute crash points to control zone
+within_ctrl <- apply(st_within(resnoise_sf, ctrl, sparse = FALSE), 1, any)
+resnoise_sf$ctrl <- as.integer(within_ctrl)
+
+# crz_ctrl variable
+resnoise_sf$crz_ctrl <- ifelse(resnoise_sf$crz == 1, 1,
+                              ifelse(resnoise_sf$ctrl == 1, 0, NA))
+
+resnoise_sf <- select(resnoise_sf, -c("crz", "ctrl"))
+
+## subset data to only crz and ctrl noise complaints
+res_df <- dplyr::filter(resnoise_sf, resnoise_sf$crz_ctrl == 0 | resnoise_sf$crz_ctrl == 1)
+# n = 126,330 ALL residential noise complaints within crz and ctrl zones
+```
+
+```{r data check residential complaint type}
+table(res_df$problem_detail_formerly_descriptor)
+```
+
+```{r data management residential zone month}
+# create month variable
+res_df$month_year <- paste0(year(res_df$created_date), "-", sprintf("%02d",month(res_df$created_date)))
+res_df$pre_post <- ifelse(res_df$created_date > as.Date("2025-01-01"), 1, 0)
+```
+
+```{r data management residential aggregate by month year}
+# aggregate by month year
+res_zone_month_counts <- res_df %>%
+  group_by(month_year, crz_ctrl, pre_post) %>%
+  summarise(
+    count_total   = n(),
+    count_bang = sum(problem_detail_formerly_descriptor == "Banging/Pounding", na.rm = TRUE),
+    count_music = sum(problem_detail_formerly_descriptor == "Loud Music/Party", na.rm = TRUE),
+    count_talk = sum(problem_detail_formerly_descriptor == "Loud Talking", na.rm = TRUE),
+    count_tv = sum(problem_detail_formerly_descriptor == "Loud Television", na.rm = TRUE),
+    .groups = "drop"
+  )
+
+res_zone_month_counts <- as.data.frame(res_zone_month_counts)
+res_zone_month_counts <- select(res_zone_month_counts, -"geometry")
+res_zone_month_counts$zone <- as.factor(ifelse(res_zone_month_counts$crz_ctrl == 1, "crz", "ctrl"))
+```
+
+### negative control did
+```{r did plot residential zone months}
+#summary(res_zone_month_counts$count_total)
+
+res_zone_month_counts %>% 
+  group_by(month_year, zone) %>%
+
+  ggplot(aes(x = month_year, y = count_tv, color = zone, group = zone)) +
+  geom_line() +
+  labs(x = "month", y = "zone count", color = "CRZ") +
+  scale_x_discrete(breaks = function(x) x[seq(1, length(x), by = 2)]) +
+  geom_vline(xintercept = "2025-01", linetype = "solid", color = "black") +
+  theme_minimal() +
+   theme(axis.text.x = element_text(angle = 90, hjust = 1)) 
+
+```
+
+```{r did residential zone months}
+did_res_zone_month <- glm(count_bang ~ pre_post + crz_ctrl + pre_post*crz_ctrl, data = res_zone_month_counts, family = "poisson")
+
+summary(did_res_zone_month)
+exp(coef(did_res_zone_month))
+exp(confint(did_res_zone_month))
+
+#cluster-robust standard errors
+clustered_vcov <- vcovCL(did_zone_month2, cluster = ~month_year)
+exp(coef(coeftest(did_zone_month2, vcov = clustered_vcov)))
+exp(confint(coeftest(did_zone_month2, vcov = clustered_vcov)))
+```
+
+### separate its: negative control residential noise 
+```{r its residential set up}
+# create season variable, by month
+# winter: dec, jan, feb
+# spring: mar, apr, may
+# summer: jun, jul, aug
+# autumn: sept, oct, nov
+res_zone_month_counts$season <- ifelse(grepl("-01|-02|-12", zone_month_counts$month_year), 1, 
+                                  ifelse(grepl("-03|-04|-05", zone_month_counts$month_year), 2, 
+                                         ifelse(grepl("-06|-07|-08", zone_month_counts$month_year), 3, 4)))
+
+```
+#### crz: its 
+```{r its: crz residential noise}
+res_zone_month_counts %>%
+  filter(crz_ctrl == 1) %>%
+  mutate(time = row_number()) %>%
+glm(count_total ~ time + pre_post + time*pre_post + season, data = ., family = "poisson") -> crz_res
+
+summary(crz_res)
+exp(coef(crz_res))
+exp(confint(crz_res))
+```
+
+### ctrl: its 
+```{r its: crz residential noise}
+res_zone_month_counts %>%
+  filter(crz_ctrl == 0) %>%
+  mutate(time = row_number()) %>%
+glm(count_total ~ time + pre_post + time*pre_post + season, data = ., family = "poisson") -> ctrl_res
+
+summary(ctrl_res)
+exp(coef(ctrl_res))
+exp(confint(ctrl_res))
+```

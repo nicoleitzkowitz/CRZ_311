@@ -1,0 +1,25 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# RStudio
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+
+# old scripts
+311_noise.R
+
+# folders
+/manuscript
+/output
+
+# huge csv file (use opendata api in code instead)
+311_Service_Requests_20240101_20260101_noise.csv
+
+# other stuff
+*.html
+*.pdf
